@@ -1,4 +1,4 @@
-#/usr/bin/env python3
+#!/usr/bin/env python3
 
 # Author: Dr. Kristina K. Gagalova
 # Created on: 25 September 2024
@@ -19,6 +19,18 @@ def convert_time_to_hours(time_str):
     if "s" in time_str:
         seconds = float(time_str.split("s")[0].strip())
     return hours + minutes / 60 + seconds / 3600
+
+# Function to convert memory strings to GB
+def convert_memory_to_gb(memory_str):
+    memory_str = memory_str.strip().upper()
+    if "GB" in memory_str:
+        return float(memory_str.replace("GB", "").strip())
+    elif "MB" in memory_str:
+        return float(memory_str.replace("MB", "").strip()) / 1024
+    elif "KB" in memory_str:
+        return float(memory_str.replace("KB", "").strip()) / (1024 * 1024)
+    else:
+        raise ValueError(f"Unknown memory unit in '{memory_str}'")
 
 # Function to calculate service units (SU)
 def calculate_su(cpu_percent, duration_str, cores_per_node=64):
@@ -41,18 +53,21 @@ def parse_input_file(file_path):
             task_id = row[0]
             duration = row[7]  # Extract duration
             cpu_percent = float(row[9].replace('%', ''))  # Extract CPU percentage
-            peak_rss = row[10]  # Extract peak_rss
-            tasks.append((task_id, cpu_percent, duration, peak_rss))
+            peak_rss = row[10]  # Extract peak_rss (memory)
+            peak_rss_gb = convert_memory_to_gb(peak_rss)  # Convert to GB
+            tasks.append((task_id, cpu_percent, duration, peak_rss_gb))
     return tasks
 
-# Function to output CPUs (not rounded), cores, SU, peak_rss, and duration in hours for each task
+# Function to output CPUs (not rounded), cores, SU, peak_rss in GB, and duration in hours for each task
 def output_results(tasks):
     cores_per_node = 64  # Assuming 64 cores per CPU (for Setonix)
     total_su = 0
+    total_mem = 0
     for task in tasks:
-        task_id, cpu_percent, duration_str, peak_rss = task
+        task_id, cpu_percent, duration_str, peak_rss_gb = task
         su = calculate_su(cpu_percent, duration_str, cores_per_node)
         total_su += su
+        total_mem += peak_rss_gb
         total_cores = calculate_total_cores(cpu_percent, cores_per_node)
         duration_hours = convert_time_to_hours(duration_str)
 
@@ -60,25 +75,27 @@ def output_results(tasks):
         print(f"  CPUs: {cpu_percent}%")
         print(f"  Total Cores Used: {total_cores:.2f}")
         print(f"  Duration: {duration_hours:.2f} hours")
-        print(f"  Peak RSS: {peak_rss}")
+        print(f"  Peak RSS: {peak_rss_gb:.2f} GB")
         print(f"  Service Units (SU): {su:.2f}")
     print(f"\nTotal Service Units (SU) for all tasks: {total_su:.2f}")
+    print(f"Total memory peak for all tasks: {total_mem:.2f} GB")
 
 # Main function to parse arguments
 def main():
     parser = argparse.ArgumentParser(description="Calculate Service Units (SU) for a job from input file.")
-    
+
     # Define expected arguments
     parser.add_argument("file_path", type=str, help="Path to the input file")
-    
+
     # Parse the arguments
     args = parser.parse_args()
-    
+
     # Parse the input file
     tasks = parse_input_file(args.file_path)
-    
+
     # Output the results
     output_results(tasks)
 
 if __name__ == "__main__":
     main()
+
