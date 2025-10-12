@@ -2,21 +2,27 @@
 """
 slurm_quarter_usage.py — Summarise Slurm project (account) usage by quarter
 
-Computes CPU core-hours (and GPU-hours if present) for a given Slurm account (project)
-split by quarters (Q1–Q4) in a calendar year. Optionally exports a CSV and prints a
-per-quarter table with job counts and breakdowns.
+Adds SU calculation consistent with the Pawsey SU calculator:
 
-Also reports per-quarter:
-- Peak allocated memory (GB)
-- Number of jobs with allocated memory ≥ 200 GB
-- Basic success/failure stats (Completed vs common failure terminal states)
-- Estimated Service Units (SU) using Setonix node specs
+  SUs = Partition Charge Rate × Max Proportion × Nodes × Hours
 
-Requires: sacct (Slurm accounting) with job-level access to the specified account.
+where:
+  Core proportion  = requested CPUs per node / cores_per_node
+  Mem proportion   = requested MEM per node (GB) / accounting_mem_cap(GB)
+  GPU proportion   = requested GPUs per node / gpus_per_node  (0 for CPU parts)
+  Max Proportion   = max(core, mem, gpu), capped at 1.0
 
-Example:
-  python slurm_quarter_usage.py --account aagi --year 2025 --csv usage_2025.csv
-  python slurm_quarter_usage.py -A aagi --year 2025 --users --json usage.json
+Default charge rates:
+  CPU (std/HM): 128 SU / node-hour
+  GPU (std/HM): 512 SU / node-hour
+
+Default accounting memory caps (GB):
+  cpu:    230.0
+  cpu-hm: 987.5
+  gpu:    230.0     # Adjust if your site uses a different accounting cap
+  gpu-hm: 512.0     # Adjust if your site uses a different accounting cap
+
+Everything else (tables/CSV/JSON) unchanged.
 """
 
 import argparse
@@ -71,7 +77,7 @@ def parse_alloc_tres(tres_str: str) -> Dict[str, float]:
                     num = float(m.group(1))
                     unit = m.group(2) or "G"
                     scale = {"K": 1/1048576, "M": 1/1024, "G": 1, "T": 1024, "P": 1024*1024}[unit]
-                    tres[k] = num * scale  # in GB
+                    tres[k] = num * scale  # in GB (per-node)
                 else:
                     tres[k] = float(v)
             else:
@@ -95,7 +101,6 @@ def fetch_jobs(account: str, start: dt.datetime, end: dt.datetime,
         sys.exit(1)
 
     state_filter = ",".join(states) if states else None
-    # Add NNodes and Partition so we can estimate SU
     fmt = ["JobID", "User", "Account", "State", "ElapsedRaw", "NNodes", "Partition", "AllocTRES"]
     cmd = [
         "sacct", "-a", "-X", "--parsable2",
@@ -137,22 +142,22 @@ def fetch_jobs(account: str, start: dt.datetime, end: dt.datetime,
         ))
     return jobs
 
-# ----------------------------- Setonix SU model -----------------------------
-# Defaults based on Pawsey docs
+# ----------------------------- Setonix capacities & SU model -----------------------------
+# Physical capacities (for proportions of cores/GPU only). Memory *accounting caps* are below.
 SETONIX_CAPS = {
-    "cpu":      {"cores_per_node": 128, "mem_gb": 256,  "gcds": 0},
-    "cpu-hm":   {"cores_per_node": 128, "mem_gb": 1024, "gcds": 0},
-    "gpu":      {"cores_per_node": 64,  "mem_gb": 256,  "gcds": 8},
-    "gpu-hm":   {"cores_per_node": 64,  "mem_gb": 512,  "gcds": 8},
+    "cpu":      {"cores_per_node": 128, "gpus_per_node": 0},
+    "cpu-hm":   {"cores_per_node": 128, "gpus_per_node": 0},
+    "gpu":      {"cores_per_node": 64,  "gpus_per_node": 8},
+    "gpu-hm":   {"cores_per_node": 64,  "gpus_per_node": 8},
 }
 
+# Partition classification
 def classify_partition(name: str) -> str:
     n = (name or "").lower()
     if "gpu" in n:
         if "hm" in n or "high" in n:
             return "gpu-hm"
         return "gpu"
-    # CPU side
     if "hm" in n or "high" in n:
         return "cpu-hm"
     return "cpu"
@@ -160,33 +165,50 @@ def classify_partition(name: str) -> str:
 def safe_div(a: float, b: float) -> float:
     return (a / b) if (b and b > 0) else 0.0
 
+# Defaults: charge rates & accounting memory caps (GB)
+CHARGE_RATES = {
+    "cpu": 128.0,
+    "cpu-hm": 128.0,
+    "gpu": 512.0,
+    "gpu-hm": 512.0,
+}
+ACCOUNT_MEM_CAP_GB = {
+    "cpu": 230.0,
+    "cpu-hm": 987.5,
+    "gpu": 230.0,     # adjust via CLI if your site uses a different cap
+    "gpu-hm": 512.0,  # adjust via CLI if your site uses a different cap
+}
+
 def estimate_job_su(j: JobRec) -> float:
-    """Estimate SUs for one job using Setonix capacities and dominant-resource rule."""
+    """
+    Pawsey-style SU:
+      SUs = rate(partition) * max(core_prop, mem_prop_accounting, gpu_prop) * nodes * hours
+    """
     cls = classify_partition(j.partition)
     caps = SETONIX_CAPS.get(cls, SETONIX_CAPS["cpu"])
+    rate = CHARGE_RATES.get(cls, 128.0)
+    mem_cap = ACCOUNT_MEM_CAP_GB.get(cls, 230.0)
 
-    # Totals in AllocTRES are job-wide; derive per-node
     nn = max(j.nnodes, 1)
+    hours = j.elapsed_s / 3600.0
+
     cpus_total = j.alloc_tres.get("cpu", 0.0)
     gpus_total = 0.0
     for key in ("gres/gpu", "gpu"):
         if key in j.alloc_tres:
             gpus_total = max(gpus_total, j.alloc_tres[key])
-    # mem in AllocTRES is already per-node GB (Slurm reports per-node mem)
-    mem_per_node_gb = j.alloc_tres.get("mem", 0.0)
+    mem_per_node_gb = j.alloc_tres.get("mem", 0.0)  # sacct reports per-node GB
 
     cpus_per_node = cpus_total / nn if cpus_total else 0.0
-    gcds_per_node = gpus_total / nn if gpus_total else 0.0
+    gpus_per_node = gpus_total / nn if gpus_total else 0.0
 
-    f_core = min(1.0, safe_div(cpus_per_node, caps["cores_per_node"]))
-    f_mem  = min(1.0, safe_div(mem_per_node_gb,  caps["mem_gb"]))
-    f_gpu  = min(1.0, safe_div(gcds_per_node,    caps["gcds"])) if caps["gcds"] else 0.0
+    core_prop = safe_div(cpus_per_node, caps["cores_per_node"])
+    mem_prop  = safe_div(mem_per_node_gb,  mem_cap)
+    gpu_prop  = safe_div(gpus_per_node,    caps["gpus_per_node"]) if caps["gpus_per_node"] else 0.0
 
-    util = max(f_core, f_mem, f_gpu)
-
-    node_hours = nn * (j.elapsed_s / 3600.0)
-    su = node_hours * caps["cores_per_node"] * util  # 1 SU == 1 core-hour
-    return su
+    max_prop = min(1.0, max(core_prop, mem_prop, gpu_prop))
+    sus = rate * max_prop * nn * hours
+    return sus
 
 # ----------------------------- Aggregation -----------------------------
 SUCCESS_STATES = {"COMPLETED", "CD"}
@@ -249,18 +271,46 @@ def main():
     ap.add_argument("--users", action="store_true", help="Show top users per quarter")
     ap.add_argument("--limit", type=int, default=5, help="Top-N users to show when --users is set (default 5)")
     ap.add_argument("--json", dest="json_out", default=None, help="Also write raw JSON to this file")
-    # Optional overrides for node capacities if Pawsey updates them
-    ap.add_argument("--cpu-mem", type=int, default=SETONIX_CAPS["cpu"]["mem_gb"], help="CPU node memory GB (default 256)")
-    ap.add_argument("--cpu-hm-mem", type=int, default=SETONIX_CAPS["cpu-hm"]["mem_gb"], help="CPU high-mem node memory GB (default 1024)")
-    ap.add_argument("--gpu-mem", type=int, default=SETONIX_CAPS["gpu"]["mem_gb"], help="GPU node memory GB (default 256)")
-    ap.add_argument("--gpu-hm-mem", type=int, default=SETONIX_CAPS["gpu-hm"]["mem_gb"], help="GPU high-mem node memory GB (default 512)")
+
+    # Optional overrides for physical capacities (cores, GPUs)
+    ap.add_argument("--cpu-cores", type=int, default=SETONIX_CAPS["cpu"]["cores_per_node"])
+    ap.add_argument("--cpu-hm-cores", type=int, default=SETONIX_CAPS["cpu-hm"]["cores_per_node"])
+    ap.add_argument("--gpu-cores", type=int, default=SETONIX_CAPS["gpu"]["cores_per_node"])
+    ap.add_argument("--gpu-hm-cores", type=int, default=SETONIX_CAPS["gpu-hm"]["cores_per_node"])
+    ap.add_argument("--gpu-per-node", type=int, default=SETONIX_CAPS["gpu"]["gpus_per_node"])
+    ap.add_argument("--gpu-hm-per-node", type=int, default=SETONIX_CAPS["gpu-hm"]["gpus_per_node"])
+
+    # Charge rates (SU / node-hour)
+    ap.add_argument("--rate-cpu", type=float, default=CHARGE_RATES["cpu"])
+    ap.add_argument("--rate-cpu-hm", type=float, default=CHARGE_RATES["cpu-hm"])
+    ap.add_argument("--rate-gpu", type=float, default=CHARGE_RATES["gpu"])
+    ap.add_argument("--rate-gpu-hm", type=float, default=CHARGE_RATES["gpu-hm"])
+
+    # Accounting memory caps (GB) — NOT physical memory
+    ap.add_argument("--acc-mem-cpu", type=float, default=ACCOUNT_MEM_CAP_GB["cpu"])
+    ap.add_argument("--acc-mem-cpu-hm", type=float, default=ACCOUNT_MEM_CAP_GB["cpu-hm"])
+    ap.add_argument("--acc-mem-gpu", type=float, default=ACCOUNT_MEM_CAP_GB["gpu"])
+    ap.add_argument("--acc-mem-gpu-hm", type=float, default=ACCOUNT_MEM_CAP_GB["gpu-hm"])
 
     args = ap.parse_args()
-    # apply any mem overrides
-    SETONIX_CAPS["cpu"]["mem_gb"]     = args.cpu_mem
-    SETONIX_CAPS["cpu-hm"]["mem_gb"]  = args.cpu_hm_mem
-    SETONIX_CAPS["gpu"]["mem_gb"]     = args.gpu_mem
-    SETONIX_CAPS["gpu-hm"]["mem_gb"]  = args.gpu_hm_mem
+
+    # apply overrides
+    SETONIX_CAPS["cpu"]["cores_per_node"]     = args.cpu_cores
+    SETONIX_CAPS["cpu-hm"]["cores_per_node"]  = args.cpu_hm_cores
+    SETONIX_CAPS["gpu"]["cores_per_node"]     = args.gpu_cores
+    SETONIX_CAPS["gpu-hm"]["cores_per_node"]  = args.gpu_hm_cores
+    SETONIX_CAPS["gpu"]["gpus_per_node"]      = args.gpu_per_node
+    SETONIX_CAPS["gpu-hm"]["gpus_per_node"]   = args.gpu_hm_per_node
+
+    CHARGE_RATES["cpu"]    = args.rate_cpu
+    CHARGE_RATES["cpu-hm"] = args.rate_cpu_hm
+    CHARGE_RATES["gpu"]    = args.rate_gpu
+    CHARGE_RATES["gpu-hm"] = args.rate_gpu_hm
+
+    ACCOUNT_MEM_CAP_GB["cpu"]    = args.acc_mem_cpu
+    ACCOUNT_MEM_CAP_GB["cpu-hm"] = args.acc_mem_cpu_hm
+    ACCOUNT_MEM_CAP_GB["gpu"]    = args.acc_mem_gpu
+    ACCOUNT_MEM_CAP_GB["gpu-hm"] = args.acc_mem_gpu_hm
 
     ranges = quarter_ranges(args.year)
 
