@@ -23,6 +23,8 @@ Default accounting memory caps (GB):
   gpu-hm: 512.0     # Adjust if your site uses a different accounting cap
 
 Everything else (tables/CSV/JSON) unchanged.
+
+This version removes the dataclasses dependency for older Python installs.
 """
 
 import argparse
@@ -34,20 +36,32 @@ import shutil
 import subprocess
 import sys
 from collections import Counter
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 # ----------------------------- Utility types -----------------------------
-@dataclass
 class JobRec:
-    jobid: str
-    user: str
-    account: str
-    state: str
-    elapsed_s: int
-    nnodes: int
-    partition: str
-    alloc_tres: Dict[str, float]  # {"cpu": total, "mem": GB_per_node, "gres/gpu": total}
+    def __init__(self, jobid, user, account, state, elapsed_s, nnodes, partition, alloc_tres):
+        self.jobid = jobid
+        self.user = user
+        self.account = account
+        self.state = state
+        self.elapsed_s = elapsed_s
+        self.nnodes = nnodes
+        self.partition = partition
+        self.alloc_tres = alloc_tres  # {"cpu": total, "mem": GB_per_node, "gres/gpu": total}
+
+class QuarterStats:
+    def __init__(self):
+        self.jobs = 0
+        self.cpu_core_hours = 0.0
+        self.gpu_hours = 0.0
+        self.users = Counter()
+        self.states = Counter()
+        self.peak_mem_gb = 0.0
+        self.jobs_mem_ge_200 = 0
+        self.success_jobs = 0
+        self.failed_jobs = 0
+        self.su_total = 0.0
 
 # ----------------------------- Helpers -----------------------------
 def have_cmd(name: str) -> bool:
@@ -57,7 +71,11 @@ def run(cmd: List[str]) -> str:
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
     except subprocess.CalledProcessError as e:
-        print(f"ERROR running {' '.join(cmd)}\n{e.output.decode()}", file=sys.stderr)
+        try:
+            msg = e.output.decode()
+        except Exception:
+            msg = str(e.output)
+        print("ERROR running {}\n{}".format(" ".join(cmd), msg), file=sys.stderr)
         sys.exit(2)
     return out.decode()
 
@@ -116,6 +134,7 @@ def fetch_jobs(account: str, start: dt.datetime, end: dt.datetime,
     lines = [ln for ln in raw.splitlines() if ln.strip()]
     if not lines:
         return []
+
     header = lines[0].split("|")
     col_idx = {name: i for i, name in enumerate(header)}
     jobs: List[JobRec] = []
@@ -126,10 +145,17 @@ def fetch_jobs(account: str, start: dt.datetime, end: dt.datetime,
         if "." in jobid:  # skip steps
             continue
         state = parts[col_idx["State"]].split()[0]
-        elapsed = int(parts[col_idx["ElapsedRaw"]] or 0)
-        nnodes = int(parts[col_idx["NNodes"]] or 0)
+        try:
+            elapsed = int(parts[col_idx["ElapsedRaw"]] or 0)
+        except ValueError:
+            elapsed = 0
+        try:
+            nnodes = int(parts[col_idx["NNodes"]] or 0)
+        except ValueError:
+            nnodes = 0
         partition = (parts[col_idx["Partition"]] or "").strip()
         tres = parse_alloc_tres(parts[col_idx["AllocTRES"]] or "")
+
         jobs.append(JobRec(
             jobid=jobid,
             user=parts[col_idx["User"]],
@@ -199,8 +225,8 @@ def estimate_job_su(j: JobRec) -> float:
             gpus_total = max(gpus_total, j.alloc_tres[key])
     mem_per_node_gb = j.alloc_tres.get("mem", 0.0)  # sacct reports per-node GB
 
-    cpus_per_node = cpus_total / nn if cpus_total else 0.0
-    gpus_per_node = gpus_total / nn if gpus_total else 0.0
+    cpus_per_node = (cpus_total / nn) if cpus_total else 0.0
+    gpus_per_node = (gpus_total / nn) if gpus_total else 0.0
 
     core_prop = safe_div(cpus_per_node, caps["cores_per_node"])
     mem_prop  = safe_div(mem_per_node_gb,  mem_cap)
@@ -214,23 +240,6 @@ def estimate_job_su(j: JobRec) -> float:
 SUCCESS_STATES = {"COMPLETED", "CD"}
 FAILURE_STATES = {"FAILED","F","CANCELLED","CA","TIMEOUT","TO",
                   "NODE_FAIL","NF","PREEMPTED","PR","DEADLINE","DL","BOOT_FAIL","BF"}
-
-@dataclass
-class QuarterStats:
-    jobs: int = 0
-    cpu_core_hours: float = 0.0
-    gpu_hours: float = 0.0
-    users: Counter = None
-    states: Counter = None
-    peak_mem_gb: float = 0.0
-    jobs_mem_ge_200: int = 0
-    success_jobs: int = 0
-    failed_jobs: int = 0
-    su_total: float = 0.0
-
-    def __post_init__(self):
-        if self.users is None: self.users = Counter()
-        if self.states is None: self.states = Counter()
 
 def accumulate(jobs: List[JobRec]) -> QuarterStats:
     stats = QuarterStats()
@@ -249,12 +258,16 @@ def accumulate(jobs: List[JobRec]) -> QuarterStats:
         stats.gpu_hours += (gpus * j.elapsed_s) / 3600.0
 
         mem_gb = j.alloc_tres.get("mem", 0.0)
-        stats.peak_mem_gb = max(stats.peak_mem_gb, mem_gb)
-        if mem_gb >= 200: stats.jobs_mem_ge_200 += 1
+        if mem_gb > stats.peak_mem_gb:
+            stats.peak_mem_gb = mem_gb
+        if mem_gb >= 200:
+            stats.jobs_mem_ge_200 += 1
 
-        st = j.state.upper()
-        if st in SUCCESS_STATES: stats.success_jobs += 1
-        elif st in FAILURE_STATES: stats.failed_jobs += 1
+        st = (j.state or "").upper()
+        if st in SUCCESS_STATES:
+            stats.success_jobs += 1
+        elif st in FAILURE_STATES:
+            stats.failed_jobs += 1
 
         stats.su_total += estimate_job_su(j)
 
@@ -314,13 +327,15 @@ def main():
 
     ranges = quarter_ranges(args.year)
 
-    print(f"Account: {args.account} | Year: {args.year}")
+    print("Account: {} | Year: {}".format(args.account, args.year))
     print("States included:", ", ".join(args.states))
     print()
 
     hdr = (
-        f"{'Quarter':6}  {'Jobs':>6}  {'CPU core-hrs':>14}  {'GPU-hrs':>10}  "
-        f"{'PeakMem(GB)':>11}  {'Jobs≥200GB':>11}  {'Succ':>6}  {'Fail':>6}  {'Succ%':>6}  {'SUs':>12}"
+        "{:6}  {:>6}  {:>14}  {:>10}  {:>11}  {:>11}  {:>6}  {:>6}  {:>6}  {:>12}".format(
+            "Quarter", "Jobs", "CPU core-hrs", "GPU-hrs",
+            "PeakMem(GB)", "Jobs≥200GB", "Succ", "Fail", "Succ%", "SUs"
+        )
     )
     print(hdr)
     print("-" * len(hdr))
@@ -334,17 +349,19 @@ def main():
         success_rate = (100.0 * stats.success_jobs / stats.jobs) if stats.jobs else 0.0
 
         print(
-            f"{qname:6}  {stats.jobs:6d}  {stats.cpu_core_hours:14.2f}  {stats.gpu_hours:10.2f}  "
-            f"{stats.peak_mem_gb:11.2f}  {stats.jobs_mem_ge_200:11d}  "
-            f"{stats.success_jobs:6d}  {stats.failed_jobs:6d}  {success_rate:6.1f}  {stats.su_total:12.2f}"
+            "{:6}  {:6d}  {:14.2f}  {:10.2f}  {:11.2f}  {:11d}  {:6d}  {:6d}  {:6.1f}  {:12.2f}".format(
+                qname, stats.jobs, stats.cpu_core_hours, stats.gpu_hours,
+                stats.peak_mem_gb, stats.jobs_mem_ge_200,
+                stats.success_jobs, stats.failed_jobs, success_rate, stats.su_total
+            )
         )
 
         if args.users and stats.jobs:
             topu = stats.users.most_common(args.limit)
-            tops = ", ".join([f"{u}:{n}" for u, n in topu])
-            print(f"           Top users: {tops}")
-            top_states = ", ".join([f"{s}:{c}" for s, c in stats.states.most_common()])
-            print(f"           States: {top_states}")
+            tops = ", ".join(["{}:{}".format(u, n) for u, n in topu])
+            print("           Top users: {}".format(tops))
+            top_states = ", ".join(["{}:{}".format(s, c) for s, c in stats.states.most_common()])
+            print("           States: {}".format(top_states))
 
         csv_row = {
             "quarter": qname,
@@ -370,8 +387,8 @@ def main():
             "failed_jobs": stats.failed_jobs,
             "success_rate": success_rate,
             "sus": stats.su_total,
-            "states": stats.states,
-            "users": stats.users,
+            "states": dict(stats.states),
+            "users": dict(stats.users),
         }
 
     if args.csv:
@@ -384,20 +401,12 @@ def main():
             w.writeheader()
             for r in csv_rows:
                 w.writerow(r)
-        print(f"\nWrote CSV -> {args.csv}")
+        print("\nWrote CSV -> {}".format(args.csv))
 
     if args.json_out:
-        blob_serialisable = {
-            q: {
-                **{k: v for k, v in v.items() if k not in ("states","users")},
-                "states": dict(v["states"]),
-                "users": dict(v["users"]),
-            }
-            for q, v in json_blob.items()
-        }
         with open(args.json_out, "w") as fh:
-            json.dump(blob_serialisable, fh, indent=2)
-        print(f"Wrote JSON -> {args.json_out}")
+            json.dump(json_blob, fh, indent=2)
+        print("Wrote JSON -> {}".format(args.json_out))
 
 if __name__ == "__main__":
     main()
