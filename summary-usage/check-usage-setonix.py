@@ -2,6 +2,7 @@
 """
 check-setonix-usage.py — Summarise Slurm project (account) usage by quarter
 This script has slight differences from the official Pawsey command - 'pawseyAccountBalance' but it mostly reflects its output.
+More details here about the official pawsey command - https://pawsey.atlassian.net/wiki/spaces/US/pages/51925964/Job+Scheduling#Computing-time-allocation-usage
 
 This version is designed to track Pawsey project usage more closely.
 
