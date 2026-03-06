@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 check-setonix-usage.py — Summarise Slurm project (account) usage by quarter
+This script has slight differences from the official Pawsey command - 'pawseyAccountBalance' but it mostly reflects its output.
 
 This version is designed to track Pawsey project usage more closely.
 
